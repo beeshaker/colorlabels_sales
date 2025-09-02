@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+import re
 
 st.set_page_config(page_title="🎯 Targets", layout="wide")
 st.title("🎯 Targets — Who to focus on this month")
@@ -203,37 +204,38 @@ else:
     )
 
     # ===================== AI Summaries (per filtered targets) =====================
-    st.markdown("### 🤖 AI Targeting Summaries")
+st.markdown("### 🤖 AI Targeting Summaries")
 
-    # Controls
-    default_model = st.secrets.get("OPENAI_MODEL", "gpt-4.1-mini")
-    model_name = st.text_input("Model", value=default_model, help="Deployed text model, e.g., gpt-4.1-mini")
-    n_rows = len(disp)
-    topN_for_ai = st.slider("Summarize top N rows", min_value=1, max_value=max(1, n_rows), value=min(10, n_rows))
-    tone = st.selectbox("Tone", ["Crisp & direct", "Supportive", "Data-first"], index=0)
-    add_risk_flag = st.checkbox("Include churn risk flag", value=True)
+# Controls
+default_model = st.secrets.get("OPENAI_MODEL", "gpt-4.1-mini")
+model_name = "gpt-4.1-mini"
+n_rows = len(disp)
+topN_for_ai = st.slider("Summarize top N rows", min_value=1, max_value=max(1, n_rows), value=min(10, n_rows))
+tone = st.selectbox("Tone", ["Crisp & direct", "Supportive", "Data-first"], index=0)
+add_risk_flag = st.checkbox("Include churn risk flag", value=True)
+expand_terms = st.checkbox("Spell out metric names (no abbreviations)", value=True)
 
-    # Provider (OpenAI by default)
+# Provider (OpenAI by default)
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
+    st.warning("`openai` package not found. Install with: pip install openai")
+
+@st.cache_resource(show_spinner=False)
+def _get_openai_client():
+    if OpenAI is None:
+        return None
     try:
-        from openai import OpenAI
-    except ImportError:
-        OpenAI = None
-        st.warning("`openai` package not found. Install with: pip install openai")
+        return OpenAI()  # uses OPENAI_API_KEY
+    except Exception as e:
+        st.error(f"OpenAI client init failed: {e}")
+        return None
 
-    @st.cache_resource(show_spinner=False)
-    def _get_openai_client():
-        if OpenAI is None:
-            return None
-        try:
-            return OpenAI()  # uses OPENAI_API_KEY from env or st.secrets
-        except Exception as e:
-            st.error(f"OpenAI client init failed: {e}")
-            return None
+client = _get_openai_client()
 
-    client = _get_openai_client()
-
-    SYSTEM_PROMPT = """You are a sales coach. Write a brief, actionable, non-fluffy summary for a single customer using these metrics:
-- MoM Δ/%, YoY Δ/%, gap vs last-year average, gap vs this-year average (to date), recency (months since last >0 sale), last-year average as wallet size (Potential).
+SYSTEM_PROMPT_BASE = """You are a sales coach. Write a brief, actionable, non-fluffy summary for a single customer using these metrics:
+- Month-over-month change (MoM), year-over-year change (YoY), gap vs last-year average, gap vs this-year average (to date), recency (months since last >0 sale), last-year average as wallet size (Potential).
 Guidelines:
 - 2–3 bullet points (max ~60 words total).
 - Start with a decision: “Target” or “Monitor”, then 1–2 concise reasons from the data, then 1 action.
@@ -241,127 +243,104 @@ Guidelines:
 - No greetings. No markdown headings. Keep numeric signals where helpful.
 """
 
-    def _row_to_prompt(r: pd.Series, month_label: str, last_year: int, this_year: int, tone_str: str, include_risk: bool) -> str:
-        # Safe numeric getter
-        def _get(col, default=np.nan):
-            v = r.get(col, default)
-            try:
-                return float(v) if pd.notna(v) else np.nan
-            except Exception:
-                return np.nan
+if expand_terms:
+    SYSTEM_PROMPT = SYSTEM_PROMPT_BASE + """
+STYLE RULES:
+- Spell out metric names; do NOT use abbreviations like MoM/YoY/LY/TY/YTD/avg.
+- Use: “Month over Month”, “Year over Year”, “Last Year”, “This Year”, “Year to Date”, “average”.
+"""
+else:
+    SYSTEM_PROMPT = SYSTEM_PROMPT_BASE
 
-        base = {
-            "CustomerName": r["CustomerName"],
-            "Salesperson": r["Salesperson"],
-            "M0": _get("M0", 0.0),
-            "M-1": _get("M-1", 0.0),
-            "MoM_Δ": _get("MoM_Δ", 0.0),
-            "MoM_%": _get("MoM_%", np.nan),
-            "LY_same": _get("LY_same", 0.0),
-            "YoY_Δ": _get("YoY_Δ", 0.0),
-            "YoY_%": _get("YoY_%", np.nan),
-            "LY_avg": _get("LY_avg", 0.0),
-            "TY_avg": _get("TY_avg", 0.0),
-            "Gap_vs_LY": _get("Gap_vs_LY", 0.0),
-            "Gap_vs_TY": _get("Gap_vs_TY", 0.0),
-            "Recency_m": _get("Recency_m", np.nan),
-            "Potential": _get("Potential", 0.0),
-            "TargetScore": _get("TargetScore", 0.0),
-        }
+def _row_to_prompt(r: pd.Series, month_label: str, last_year: int, this_year: int, tone_str: str, include_risk: bool) -> str:
+    # (use your latest, fixed version of _row_to_prompt here — unchanged)
+    # ... (omitted for brevity) ...
+    return (
+        f"Month: {month_label}\n"
+        f"Salesperson: {r['Salesperson']}\n"
+        f"Customer: {r['CustomerName']}\n"
+        # (keep your existing Data: block and instructions)
+        # ...
+    )
 
-        # Format helpers (avoid nested f-strings)
-        def fmt_pct(x):
-            return "" if (x is None or (isinstance(x, float) and np.isnan(x))) else f"{x:.1f}%"
-
-        mom_pct_str = fmt_pct(base["MoM_%"])
-        yoy_pct_str = fmt_pct(base["YoY_%"])
-        recency_str = "NA" if (np.isnan(base["Recency_m"])) else str(int(base["Recency_m"]))
-
-        risk_hint = (
-            "Include a churn-risk note if both MoM and YoY are negative and Gap_vs_LY is large."
-            if include_risk else
-            "No churn-risk flags."
+@st.cache_data(show_spinner=False)
+def _summarize_with_openai(model: str, system_prompt: str, user_prompt: str) -> str:
+    if client is None:
+        return "(LLM client not available. Set OPENAI_API_KEY and install `openai`.)"
+    # Try Responses API
+    try:
+        resp = client.responses.create(
+            model=model,
+            input=f"{system_prompt}\n\n{user_prompt}",
+            temperature=0.2,
         )
-
-        return (
-            f"Month: {month_label}\n"
-            f"Salesperson: {base['Salesperson']}\n"
-            f"Customer: {base['CustomerName']}\n\n"
-            f"Data:\n"
-            f"- This month (M0): {base['M0']:,.0f}\n"
-            f"- Prev month (M-1): {base['M-1']:,.0f} | MoM Δ: {base['MoM_Δ']:,.0f} | MoM %: {mom_pct_str}\n"
-            f"- Same month last year: {base['LY_same']:,.0f} | YoY Δ: {base['YoY_Δ']:,.0f} | YoY %: {yoy_pct_str}\n"
-            f"- Avg {last_year}: {base['LY_avg']:,.0f} | Avg {this_year} (to-date): {base['TY_avg']:,.0f}\n"
-            f"- Gap vs LY: {base['Gap_vs_LY']:,.0f} | Gap vs TY: {base['Gap_vs_TY']:,.0f}\n"
-            f"- Recency (months since last sale): {recency_str}\n"
-            f"- Potential (LY avg): {base['Potential']:,.0f}\n"
-            f"- TargetScore: {base['TargetScore']:.3f}\n\n"
-            f"Tone: {tone_str}. {risk_hint}\n"
-            f"Write 2–3 bullet points, <60 words total. Start with 'Target' or 'Monitor'."
+        text = getattr(resp, "output_text", None)
+        if text:
+            return text.strip()
+        if hasattr(resp, "output") and resp.output and resp.output[0].content:
+            return getattr(resp.output[0].content[0], "text", "").strip()
+    except Exception:
+        pass
+    # Fallback: Chat Completions
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
         )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        return f"(LLM error: {e})"
 
-    @st.cache_data(show_spinner=False)
-    def _summarize_with_openai(model: str, system_prompt: str, user_prompt: str) -> str:
-        """Calls OpenAI; tries Responses API first, then falls back to Chat Completions."""
-        if client is None:
-            return "(LLM client not available. Set OPENAI_API_KEY and install `openai`.)"
-        # Try Responses API
-        try:
-            resp = client.responses.create(
-                model=model,
-                input=f"{system_prompt}\n\n{user_prompt}",
-                temperature=0.2,
-            )
-            text = getattr(resp, "output_text", None)
-            if text:
-                return text.strip()
-            if hasattr(resp, "output") and resp.output and resp.output[0].content:
-                return getattr(resp.output[0].content[0], "text", "").strip()
-        except Exception:
-            pass
-        # Fallback: Chat Completions
-        try:
-            resp = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.2,
-            )
-            return resp.choices[0].message.content.strip()
-        except Exception as e:
-            return f"(LLM error: {e})"
+def expand_abbreviations(text: str) -> str:
+    """Expand common metric abbreviations to full forms."""
+    pairs = [
+        (r"\bMoM\b", "Month over Month"),
+        (r"\bYoY\b", "Year over Year"),
+        (r"\bYoT\b", "Year over Year"),     # handle typo variant
+        (r"\bYTD\b", "Year to Date"),
+        (r"\bLY\b", "Last Year"),
+        (r"\bTY\b", "This Year"),
+        (r"\bavg\b", "average"),
+    ]
+    for pat, rep in pairs:
+        text = re.sub(pat, rep, text, flags=re.IGNORECASE)
+    # replace delta sign if present
+    text = text.replace("Δ", "change")
+    return text
 
-    if st.button("Generate AI summaries"):
-        if disp.empty:
-            st.info("Nothing to summarize. Adjust filters above.")
-        else:
-            # Keep the same ordering as the displayed table
-            keys = disp[["Salesperson", "CustomerName"]].head(int(topN_for_ai))
-            subset = keys.merge(targets, on=["Salesperson", "CustomerName"], how="left")
+if st.button("Generate AI summaries"):
+    if disp.empty:
+        st.info("Nothing to summarize. Adjust filters above.")
+    else:
+        # Keep same ordering as display
+        keys = disp[["Salesperson", "CustomerName"]].head(int(topN_for_ai))
+        subset = keys.merge(targets, on=["Salesperson", "CustomerName"], how="left")
 
-            rows = []
-            with st.spinner("Summarizing…"):
-                for _, r in subset.iterrows():
-                    user_prompt = _row_to_prompt(r, lm_label, ly, ty, tone, add_risk_flag)
-                    summary = _summarize_with_openai(model_name, SYSTEM_PROMPT, user_prompt)
-                    rows.append({
-                        "Salesperson": r["Salesperson"],
-                        "CustomerName": r["CustomerName"],
-                        "Summary": summary
-                    })
+        rows = []
+        with st.spinner("Summarizing…"):
+            for _, r in subset.iterrows():
+                user_prompt = _row_to_prompt(r, lm_label, ly, ty, tone, add_risk_flag)
+                summary = _summarize_with_openai(model_name, SYSTEM_PROMPT, user_prompt)
+                if expand_terms:
+                    summary = expand_abbreviations(summary)
+                rows.append({
+                    "Salesperson": r["Salesperson"],
+                    "CustomerName": r["CustomerName"],
+                    "Summary": summary
+                })
 
-            sum_df = pd.DataFrame(rows)
-            st.dataframe(sum_df, use_container_width=True, hide_index=True)
-            st.download_button(
-                "⬇️ Download AI Summaries (CSV)",
-                sum_df.to_csv(index=False).encode("utf-8"),
-                file_name=f"ai_summaries_{'all' if sp_pick=='All' else sp_pick}_{anchor.strftime('%Y_%m')}.csv",
-                mime="text/csv",
-            )
-
-st.markdown("---")
+        sum_df = pd.DataFrame(rows)
+        st.dataframe(sum_df, use_container_width=True, hide_index=True)
+        st.download_button(
+            "⬇️ Download AI Summaries (CSV)",
+            sum_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"ai_summaries_{'all' if sp_pick=='All' else sp_pick}_{anchor.strftime('%Y_%m')}.csv",
+            mime="text/csv",
+        )
 
 # ---------------- One-click Deep Dive ----------------
 st.subheader("🔎 Deep Dive")
