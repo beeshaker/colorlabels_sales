@@ -5,23 +5,24 @@ import plotly.express as px
 import streamlit as st
 import re
 
+# ============================ Page config ============================
 st.set_page_config(page_title="🎯 Targets", layout="wide")
 st.title("🎯 Targets — Who to focus on this month")
 
-# ---- Pull processed data from session_state ----
+# ============================ Data from session ============================
 if "sales_data" not in st.session_state:
     st.info("Please go to the main page, upload your Excel, then return here.")
     st.stop()
 
 data        = st.session_state["sales_data"]
-long_df     = data["long"]        # CustomerName, Salesperson, Month (datetime), Year, Sales
-monthly_sc  = data["monthly_sc"]  # CustomerName, Salesperson, Month (datetime), Sales
+long_df     = data["long"]        # columns: CustomerName, Salesperson, Month (datetime), Year, Sales
+monthly_sc  = data["monthly_sc"]  # columns: CustomerName, Salesperson, Month (datetime), Sales
 
 if long_df.empty or monthly_sc.empty:
     st.info("No processed rows found.")
     st.stop()
 
-# Normalize Month to first-of-month timestamps (safety)
+# Normalize Month to first-of-month timestamps (defensive)
 long_df["Month"] = pd.to_datetime(long_df["Month"]).dt.to_period("M").dt.to_timestamp()
 monthly_sc["Month"] = pd.to_datetime(monthly_sc["Month"]).dt.to_period("M").dt.to_timestamp()
 
@@ -34,7 +35,29 @@ prev_m    = anchor - pd.DateOffset(months=1)
 same_m_ly = anchor - pd.DateOffset(years=1)
 ty, ly    = anchor.year, anchor.year - 1
 
-# ---------------- Helper to compute targets per salesperson ----------------
+lm_label  = anchor.strftime("%b %Y")
+pm_label  = prev_m.strftime("%b %Y")
+lym_label = same_m_ly.strftime("%b %Y")
+
+# ============================ Helpers ============================
+MONTH_HEADER_RE = re.compile(r"^[A-Za-z]{3}-\d{2}$")  # e.g., Jan-23
+
+def ksh_compact(x: float) -> str:
+    """Compact KSH formatting with K/M suffix and thousands separators."""
+    if x is None:
+        return "KSH 0"
+    try:
+        n = float(x)
+    except Exception:
+        return "KSH 0"
+    if np.isnan(n) or np.isinf(n):
+        return "KSH 0"
+    if abs(n) >= 1_000_000:
+        return f"KSH {n/1_000_000:.2f}M"
+    if abs(n) >= 1_000:
+        return f"KSH {n/1_000:.1f}K"
+    return f"KSH {n:,.0f}"
+
 def compute_targets_for_salesperson(df_sp: pd.DataFrame, anchor_ts: pd.Timestamp) -> pd.DataFrame:
     """Return a targets dataframe for ONE salesperson (df_sp already filtered to that Salesperson)."""
 
@@ -47,11 +70,11 @@ def compute_targets_for_salesperson(df_sp: pd.DataFrame, anchor_ts: pd.Timestamp
         )
 
     # Latest, previous, and same month last year
-    M0   = month_sum(anchor_ts).rename("M0")                      # this month
+    M0   = month_sum(anchor_ts).rename("M0")  # this month
     M_1  = month_sum(anchor_ts - pd.DateOffset(months=1)).rename("M-1")
     M_LY = month_sum(anchor_ts - pd.DateOffset(years=1)).rename("LY_same")
 
-    # Averages
+    # Averages (monthly)
     LY_avg = (
         df_sp[df_sp["Month"].dt.year == (anchor_ts.year - 1)]
         .groupby("CustomerName")["Sales"].mean()
@@ -74,18 +97,14 @@ def compute_targets_for_salesperson(df_sp: pd.DataFrame, anchor_ts: pd.Timestamp
                .apply(lambda x: x.n if pd.notna(x) else np.inf)
                .rename("Recency_m"))
 
-    # --- build the base table (guarantee a 'CustomerName' column) ---
-    base = pd.concat([M0, M_1, M_LY, LY_avg, TY_avg, recency], axis=1).fillna(0)
+    # Base table
+    base = pd.concat([M0, M_1, M_LY, LY_avg, TY_avg], axis=1)
     base.index.name = "CustomerName"
-    base = base.reset_index()
+    base = base.reset_index().fillna(0)
 
-    # Replace inf recency with a large sentinel (e.g., 999)
-    if "Recency_m" in base.columns:
-        base["Recency_m"] = (
-            pd.to_numeric(base["Recency_m"], errors="coerce")
-            .replace([np.inf, -np.inf], np.nan)
-            .fillna(999)
-        )
+    # Replace inf recency with large sentinel
+    rec = recency.reindex(base["CustomerName"]).fillna(np.inf).values
+    base["Recency_m"] = pd.Series(rec).replace([np.inf, -np.inf], np.nan).fillna(999)
 
     # Metrics
     base["MoM_Δ"]     = base["M0"] - base["M-1"]
@@ -94,11 +113,13 @@ def compute_targets_for_salesperson(df_sp: pd.DataFrame, anchor_ts: pd.Timestamp
     base["YoY_%"]     = np.where(base["LY_same"] != 0, base["YoY_Δ"] / base["LY_same"] * 100, np.nan)
     base["Gap_vs_LY"] = (base["LY_avg"] - base["M0"]).clip(lower=0)
     base["Gap_vs_TY"] = (base["TY_avg"] - base["M0"]).clip(lower=0)
-    base["Potential"] = base["LY_avg"]  # proxy for wallet size
 
-    # Normalized scoring (tweak weights if you like)
+    # Potential = wallet size (LY monthly average) — this is what the AI shows
+    base["Potential"] = base["LY_avg"]
+
+    # Normalized scoring (tweak weights as needed)
     def _norm(s: pd.Series) -> pd.Series:
-        s = s.copy()
+        s = pd.to_numeric(s, errors="coerce").fillna(0)
         rng = s.max() - s.min()
         return (s - s.min()) / rng if rng != 0 else pd.Series(0.0, index=s.index)
 
@@ -107,13 +128,13 @@ def compute_targets_for_salesperson(df_sp: pd.DataFrame, anchor_ts: pd.Timestamp
         0.20 * _norm(base["Gap_vs_TY"]) +
         0.20 * _norm(base["Potential"]) +
         0.20 * _norm((-base["MoM_Δ"]).clip(lower=0))
-        # + 0.15 * _norm(base["Recency_m"])  # enable if you want to push stale clients up
+        # + 0.15 * _norm(base["Recency_m"])  # enable to push stale clients up
     )
 
     base["TargetScore"] = score.round(4)
     return base
 
-# ---------------- Sidebar filters ----------------
+# ============================ Sidebar filters ============================
 st.sidebar.header("Filters")
 salespeople_all = sorted(monthly_sc["Salesperson"].dropna().astype(str).unique())
 sp_pick = st.sidebar.selectbox("Salesperson", ["All"] + salespeople_all, index=0)
@@ -132,7 +153,7 @@ has_margin = any(c.lower().replace(" ", "") in ("gp", "grossprofit", "gross_prof
 if has_margin:
     min_margin = st.sidebar.number_input("Min margin (if available)", value=0.0, step=1000.0, format="%.2f")
 
-# ---------------- Build Targets table ----------------
+# ============================ Build Targets ============================
 targets_list = []
 
 if sp_pick == "All":
@@ -173,14 +194,11 @@ if not targets.empty:
         ascending=[False, False, False]
     ).head(int(top_n))
 
-# Display
-lm_label  = anchor.strftime("%b %Y")
-pm_label  = prev_m.strftime("%b %Y")
-lym_label = same_m_ly.strftime("%b %Y")
-
+# ============================ Display table ============================
 st.subheader(f"📋 Ranked Targets — {lm_label}")
 if targets.empty:
     st.info("No rows match the current filters.")
+    disp = pd.DataFrame()
 else:
     show_cols = [
         "Salesperson", "CustomerName", "M0", "M-1", "MoM_Δ", "MoM_%", "LY_same", "YoY_Δ", "YoY_%",
@@ -203,7 +221,7 @@ else:
         mime="text/csv",
     )
 
-    # ===================== AI Summaries (per filtered targets) =====================
+# ============================ AI Summaries ============================
 st.markdown("### 🤖 AI Targeting Summaries")
 
 # Controls
@@ -235,12 +253,14 @@ def _get_openai_client():
 client = _get_openai_client()
 
 SYSTEM_PROMPT_BASE = """You are a sales coach. Write a brief, actionable, non-fluffy summary for a single customer using these metrics:
-- Month-over-month change (MoM), year-over-year change (YoY), gap vs last-year average, gap vs this-year average (to date), recency (months since last >0 sale), last-year average as wallet size (Potential).
+- Month-over-month change (MoM), year-over-year change (YoY), gap vs last-year average, gap vs this-year average (to date), recency (months since last >0 sale).
+- Potential = Wallet size defined as LAST YEAR monthly average spend (not per order, not annual).
 Guidelines:
 - 2–3 bullet points (max ~60 words total).
 - The currency is KSH only!
+- Always show numbers with compact units (K/M) and label the basis, e.g., “Wallet size (Last Year monthly average) ≈ KSH 46.5K”.
 - Start with a decision: “Target” or “Monitor”, then 1–2 concise reasons from the data, then 1 action.
-- If risk is high (sharp MoM & YoY drop and large gap vs LY), call it out.
+- If risk is high (sharp Month over Month & Year over Year drop and large gap vs Last Year), call it out.
 - No greetings. No markdown headings. Keep numeric signals where helpful.
 """
 
@@ -253,15 +273,65 @@ STYLE RULES:
 else:
     SYSTEM_PROMPT = SYSTEM_PROMPT_BASE
 
-def _row_to_prompt(r: pd.Series, month_label: str, last_year: int, this_year: int, tone_str: str, include_risk: bool) -> str:
-    # (use your latest, fixed version of _row_to_prompt here — unchanged)
-    # ... (omitted for brevity) ...
+def _row_to_prompt(r: pd.Series,
+                   month_label: str,
+                   last_year: int,
+                   this_year: int,
+                   tone_str: str,
+                   include_risk: bool) -> str:
+    """
+    Build a user prompt for a single row. Expects row columns:
+    Salesperson, CustomerName, Sales {month}, Sales {prev}, Sales {same LY}, Avg LY, Avg TY (to-date),
+    MoM_Δ, MoM_%, YoY_Δ, YoY_%, Gap_vs_LY, Gap_vs_TY, Recency_m, Potential
+    """
+    # Pull raw numbers defensively
+    m0      = float(r.get(f"Sales {month_label}", r.get("M0", 0)) or 0)
+    m_1     = float(r.get(f"Sales {prev_m.strftime('%b %Y')}", r.get("M-1", 0)) or 0)
+    m_ly    = float(r.get(f"Sales {same_m_ly.strftime('%b %Y')}", r.get("LY_same", 0)) or 0)
+    avg_ly  = float(r.get(f"Avg {last_year}", r.get("LY_avg", 0)) or 0)
+    avg_ty  = float(r.get(f"Avg {this_year} (to-date)", r.get("TY_avg", 0)) or 0)
+    mom_d   = float(r.get("MoM_Δ", 0) or (m0 - m_1))
+    yoy_d   = float(r.get("YoY_Δ", 0) or (m0 - m_ly))
+    mom_p   = float(r.get("MoM_%", np.nan))
+    yoy_p   = float(r.get("YoY_%", np.nan))
+    gap_ly  = float(r.get("Gap_vs_LY", max(avg_ly - m0, 0)))
+    gap_ty  = float(r.get("Gap_vs_TY", max(avg_ty - m0, 0)))
+    rec_m   = float(r.get("Recency_m", 999))
+    wallet  = float(r.get("Potential", avg_ly))  # Potential is LY monthly average in our table
+
+    # Format strings (K/M) for readability
+    m0_s, m1_s, mly_s   = ksh_compact(m0), ksh_compact(m_1), ksh_compact(m_ly)
+    avgly_s, avgh_s     = ksh_compact(avg_ly), ksh_compact(avg_ty)
+    momd_s, yoyd_s      = ksh_compact(mom_d), ksh_compact(yoy_d)
+    gaply_s, gapty_s    = ksh_compact(gap_ly), ksh_compact(gap_ty)
+    wallet_s            = ksh_compact(wallet)
+
+    # Percent fallbacks
+    momp_s = "—" if np.isnan(mom_p) else f"{mom_p:+.1f}%"
+    yoyo_s = "—" if np.isnan(yoy_p) else f"{yoy_p:+.1f}%"
+
+    # Compose the prompt
     return (
         f"Month: {month_label}\n"
+        f"Tone: {tone_str}\n"
+        f"IncludeRiskFlag: {include_risk}\n"
         f"Salesperson: {r['Salesperson']}\n"
         f"Customer: {r['CustomerName']}\n"
-        # (keep your existing Data: block and instructions)
-        # ...
+        "Data (use these exactly as given; prefer compact K/M formatting in output):\n"
+        f"- ThisMonth: {m0_s}\n"
+        f"- PrevMonth: {m1_s}\n"
+        f"- SameMonthLastYear: {mly_s}\n"
+        f"- AvgLastYearMonthly: {avgly_s}\n"
+        f"- AvgThisYearMonthlyToDate: {avgh_s}\n"
+        f"- MoMChangeAbs: {momd_s}\n"
+        f"- YoYChangeAbs: {yoyd_s}\n"
+        f"- MoMChangePct: {momp_s}\n"
+        f"- YoYChangePct: {yoyo_s}\n"
+        f"- GapVsLastYearAvg: {gaply_s}\n"
+        f"- GapVsThisYearAvg: {gapty_s}\n"
+        f"- RecencyMonths: {int(rec_m) if not np.isnan(rec_m) else 999}\n"
+        f"- WalletSizeMonthlyLabel: Wallet size (Last Year monthly average) ≈ {wallet_s}\n"
+        "Write a 2–3 bullet summary. Start with 'Target' or 'Monitor', then reasons, then 1 concrete action.\n"
     )
 
 @st.cache_data(show_spinner=False)
@@ -309,12 +379,11 @@ def expand_abbreviations(text: str) -> str:
     ]
     for pat, rep in pairs:
         text = re.sub(pat, rep, text, flags=re.IGNORECASE)
-    # replace delta sign if present
-    text = text.replace("Δ", "change")
-    return text
+    return text.replace("Δ", "change")
 
+# Generate summaries
 if st.button("Generate AI summaries"):
-    if disp.empty:
+    if 'disp' not in locals() or disp.empty:
         st.info("Nothing to summarize. Adjust filters above.")
     else:
         # Keep same ordering as display
@@ -343,7 +412,7 @@ if st.button("Generate AI summaries"):
             mime="text/csv",
         )
 
-# ---------------- One-click Deep Dive ----------------
+# ============================ One-click Deep Dive ============================
 st.subheader("🔎 Deep Dive")
 
 if 'disp' not in locals() or disp.empty:
@@ -456,4 +525,4 @@ if to_plot:
 else:
     st.info("No full-year month-level data available for this selection.")
 
-st.caption("> Score = weighted blend of Gap vs LY/TY, wallet size (LY avg), and recent MoM drop. Tweak weights in code if needed.")
+st.caption("> Score = weighted blend of Gap vs LY/TY, wallet size (LY monthly average), and recent MoM drop. Tweak weights in code if needed.")
